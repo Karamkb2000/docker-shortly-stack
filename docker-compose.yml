@@ -1,0 +1,151 @@
+# =============================================================================
+#  docker-compose.yml  —  shortly-stack (URL shortener)  (BUILD THIS LIVE)
+#  5 services: web (nginx) -> api (Flask:5000) -> db (Postgres) + cache (Redis),
+#  plus a worker (Node). 2 networks (frontend/backend), 2 named volumes.
+#  WRITE dependencies FIRST (db, cache) so the things that need them come after.
+#  Indentation is 2 spaces and it MATTERS in YAML.
+# =============================================================================
+
+# --- STEP 1 — project name ---------------------------------------------------
+# WHY : prefixes container/network/volume names; easy cleanup with `docker compose down`.
+# HOW : name: shortly-stack
+
+
+# --- STEP 2 — open the services block ----------------------------------------
+# HOW : services:
+
+
+  # === db (Postgres) — write this FIRST; others depend on it ===
+  # STEP 3 — WHAT: the database. WHY first: api/worker wait for it to be healthy.
+  # HOW:
+  #   db:
+  #     image: postgres:16-alpine            # pulled, not built; -alpine = small
+  #     environment:                         # official image creates user/pass/db on first boot
+  #       POSTGRES_USER: ${POSTGRES_USER}    # ${...} pulled from your .env file
+  #       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+  #       POSTGRES_DB: ${POSTGRES_DB}        # = "urls" from .env.example
+  #     volumes:
+  #       - db-data:/var/lib/postgresql/data # NAMED volume -> data SURVIVES `down`
+  #       - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro  # bind mount, :ro = read-only
+  #                                          # *.sql here runs ONLY on first init (seeds schema)
+  #     networks:
+  #       - backend                          # backend ONLY -> unreachable from the browser tier
+  #     healthcheck:
+  #       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+  #                                          # CMD-SHELL = run in a shell so ${...} expands
+  #       interval: 10s                      # check every 10s
+  #       timeout: 5s                        # fail a check after 5s
+  #       retries: 5                         # unhealthy after 5 straight fails
+  #       start_period: 20s                  # grace time at boot before fails count
+  #     restart: unless-stopped              # auto-restart on crash unless you stopped it
+
+
+  # === cache (Redis) — also a dependency, write it early ===
+  # STEP 4 — WHAT: Redis holds per-code click counters the worker aggregates.
+  # HOW:
+  #   cache:
+  #     image: redis:7-alpine
+  #     command: ["redis-server", "--save", "60", "1", "--appendonly", "no"]
+  #                                          # override default cmd (exec form, each token separate)
+  #                                          # --save 60 1 = snapshot if >=1 key changed in 60s
+  #                                          # --appendonly no = snapshots only, no AOF log
+  #     volumes:
+  #       - redis-data:/data                 # named volume so snapshots persist
+  #     networks:
+  #       - backend
+  #     healthcheck:
+  #       test: ["CMD", "redis-cli", "ping"] # CMD = exec form (no shell); replies PONG when ready
+  #       interval: 10s
+  #       timeout: 3s
+  #       retries: 5
+  #     restart: unless-stopped
+
+
+  # === api (Flask/gunicorn) — the bridge between tiers ===
+  # STEP 5 — WHAT: build our Python API image; it faces web AND reaches db/cache.
+  # NOTE: NO `PORT` env here — gunicorn's port is fixed in the Dockerfile CMD (5000).
+  # HOW:
+  #   api:
+  #     build:
+  #       context: ./api                     # build from ./api (its Dockerfile)
+  #     image: shortly-api:latest            # tag the built image
+  #     environment:
+  #       PGHOST: db                         # host = the SERVICE NAME (Docker DNS)
+  #       PGPORT: "5432"                     # quote numbers -> YAML string
+  #       PGUSER: ${POSTGRES_USER}
+  #       PGPASSWORD: ${POSTGRES_PASSWORD}
+  #       PGDATABASE: ${POSTGRES_DB}
+  #       REDIS_URL: redis://cache:6379      # host `cache` = that service's name
+  #     depends_on:
+  #       db:
+  #         condition: service_healthy       # wait until db is READY (not just started)
+  #       cache:
+  #         condition: service_healthy
+  #     networks:
+  #       - frontend                         # only service on BOTH networks
+  #       - backend
+  #     restart: unless-stopped
+
+
+  # === worker (Node) — background aggregator ===
+  # STEP 6 — WHAT: build the worker; no ports; backend only.
+  # HOW:
+  #   worker:
+  #     build:
+  #       context: ./worker
+  #     image: shortly-worker:latest
+  #     environment:
+  #       REDIS_URL: redis://cache:6379
+  #       TICK_MS: "5000"                    # loop interval in ms
+  #     depends_on:
+  #       cache:
+  #         condition: service_healthy
+  #     networks:
+  #       - backend                          # never touches the browser tier
+  #     restart: unless-stopped
+
+
+  # === web (nginx) — the ONLY service the browser reaches ===
+  # STEP 7 — WHAT: build the frontend; publish a port; wait for the api.
+  # HOW:
+  #   web:
+  #     build:
+  #       context: ./web
+  #     image: shortly-web:latest
+  #     ports:
+  #       - "8080:80"                        # HOST:CONTAINER -> open http://localhost:8080
+  #     depends_on:
+  #       api:
+  #         condition: service_healthy
+  #     networks:
+  #       - frontend                         # frontend only; never sees the db
+  #     restart: unless-stopped
+
+
+# --- STEP 8 — declare the two networks ---------------------------------------
+# WHY : web on frontend; db/cache/worker on backend; api on both.
+#       Browser tier CANNOT reach the db directly -> security by isolation.
+# HOW:
+# networks:
+#   frontend:
+#     driver: bridge                         # standard single-host network with DNS
+#   backend:
+#     driver: bridge
+
+
+# --- STEP 9 — declare the two named volumes ----------------------------------
+# WHY : Docker-managed persistent data; survives container removal + rebuilds.
+#       Wipe everything with `docker compose down -v`.
+# HOW:
+# volumes:
+#   db-data:
+#   redis-data:
+
+
+# =============================================================================
+#  RUN IT (after you've filled everything in):
+#    cp .env.example .env
+#    docker compose up --build
+#    docker compose ps          # watch health status
+#  Then open http://localhost:8080, shorten a URL, click the /r/<code> link.
+# =============================================================================
