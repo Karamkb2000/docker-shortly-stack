@@ -19,7 +19,7 @@ def get_db():
         dbname=os.environ.get("PGDATABASE", "urls"),
     )
 
-
+#test
 def ensure_schema():
     conn = get_db()
     cur = conn.cursor()
